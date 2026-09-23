@@ -1,0 +1,32 @@
+      ____ ____   ____   __        __         _   _
+     |_  _|  _ \ / ___|  \ \      / /__  __ _| |_| |__   ___ _ __
+      | || |_) | |       \ \ /\ / / _ \/ _` | __| '_ \ / _ \ '__|
+      | ||  _ <| |___     \ V  V /  __/ (_| | |_| | | |  __/ |
+     |___|_| \_\\____|     \_/\_/ \___|\__,_|\__|_| |_|\___|_|
+
+                 I R C   W E A T H E R   B O T
+                            v1.01
+
++------------------------------------------------------------+
+| IRC-WEATHER-BOT_V1.01.PY                                   |
+|------------------------------------------------------------|
+| Python IRC weather / utility bot for Libera.Chat and       |
+| compatible IRC servers.                                    |
+|                                                            |
+| [*] WeatherAPI current conditions                          |
+| [*] 2-day weather forecasts                                |
+| [*] ZIP / City / Lat-Lon lookup                            |
+| [*] TLS + SASL authentication                              |
+| [*] Auto reconnect / nickname recovery                     |
+| [*] User and global rate limiting                          |
+| [*] API response caching                                   |
+| [*] Random !warez responses                                |
+| [*] #stab channel amusement                                |
+| [*] Daily rotating logfile                                 |
+|                                                            |
+| FreeBSD / Linux  |  Python 3.12+                           |
+|                                                            |
+| github.com/GregWirth/IRC-weather-bot                       |
++------------------------------------------------------------+
+
+        "If it breaks, blame quantum-level fluctuations."
