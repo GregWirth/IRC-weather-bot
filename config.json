@@ -1,7 +1,7 @@
 {
-  "HOST": "irc.server.name",
-  "PORT": 6667,
-  "USER": "irc-nick",
+  "HOST": "irc.SERVER.com",
+  "PORT": 6697,
+  "USER": "USER-NICK-NAME",
   "CHANNELS": ["#channel01", "#channel02"],
   "TRIGGER": "#zz",
   "STAB_TRIGGER": "#stab ",
@@ -10,12 +10,12 @@
   "RATE_LIMIT_TIME": 60,
   "GLOBAL_RATE_LIMIT": 50,
   "GLOBAL_RATE_LIMIT_TIME": 60,
-  "IGNORE_TIME": 180,
   "WAREZ_TRIGGER": "!warez",
   "WAREZ_FILE": "warez-trigger.txt",
   "PING_INTERVAL": 600,
   "PING_TIMEOUT": 300,
-  "API_KEY": "enter-api-key-here",
-  "USERNAME": "irc-nick",
-  "PASSWORD": "irc-nick-password"
+  "API_KEY": "ENTER-WEATHER-API-KEY-HERE",
+  "USERNAME": "USER-NAME",
+  "PASSWORD": "USER-LOGIN-REGISTRATION-PASSWORD"
 }
+

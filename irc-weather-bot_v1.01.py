@@ -7,13 +7,14 @@ import signal
 import json
 import sys
 import os
+import ssl
+import base64
 from collections import defaultdict, deque
 from urllib.parse import quote
 import argparse
 import logging.handlers
 from cachetools import TTLCache
 import re
-from contextlib import suppress
 
 # Configure logging with adjustable levels and log rotation
 parser = argparse.ArgumentParser(description='IRC Weather Bot')
@@ -43,7 +44,7 @@ except json.JSONDecodeError as e:
 REQUIRED_CONFIG_KEYS = [
     'HOST', 'PORT', 'USER', 'CHANNELS', 'API_KEY', 'USERNAME', 'PASSWORD',
     'TRIGGER', 'RATE_LIMIT', 'RATE_LIMIT_TIME', 'GLOBAL_RATE_LIMIT', 'GLOBAL_RATE_LIMIT_TIME',
-    'IGNORE_TIME', 'WAREZ_TRIGGER', 'WAREZ_FILE', 'PING_INTERVAL', 'PING_TIMEOUT',
+    'WAREZ_TRIGGER', 'WAREZ_FILE', 'PING_INTERVAL', 'PING_TIMEOUT',
     'STAB_TRIGGER', 'STAB_FILE'
 ]
 for key in REQUIRED_CONFIG_KEYS:
@@ -60,14 +61,12 @@ RATE_LIMIT = config['RATE_LIMIT']
 RATE_LIMIT_TIME = config['RATE_LIMIT_TIME']
 GLOBAL_RATE_LIMIT = config['GLOBAL_RATE_LIMIT']
 GLOBAL_RATE_LIMIT_TIME = config['GLOBAL_RATE_LIMIT_TIME']
-IGNORE_TIME = config['IGNORE_TIME']
 WAREZ_TRIGGER = config['WAREZ_TRIGGER']
 WAREZ_FILE = config['WAREZ_FILE']
 PING_INTERVAL = config['PING_INTERVAL']
 PING_TIMEOUT = config['PING_TIMEOUT']
 
 API_KEY = config['API_KEY']
-ADMIN_USERS = config.get('ADMIN_USERS', [])
 USERNAME = config['USERNAME']
 PASSWORD = config['PASSWORD']
 
@@ -75,85 +74,76 @@ STAB_TRIGGER = config['STAB_TRIGGER']
 STAB_FILE = config['STAB_FILE']
 
 def sanitize_input(user_input):
-    """Sanitize user input to prevent command injection and control characters."""
+    """Sanitize IRC text while preserving standard IRC formatting codes."""
     sanitized = user_input.replace('\r', '').replace('\n', '').replace('\0', '')
-    sanitized = re.sub(r'[\x00-\x1F\x7F]', '', sanitized)
+
+    # Preserve common IRC formatting control codes:
+    # \x02 bold, \x03 color, \x0F reset, \x16 reverse,
+    # \x1D italic, \x1F underline.
+    sanitized = re.sub(r'[\x00\x01\x04-\x0E\x10-\x15\x17-\x1C\x1E\x7F]', '', sanitized)
+
     sanitized = sanitized.strip()
+
     # Limit input length to prevent flooding
     if len(sanitized) > 400:
         sanitized = sanitized[:400]
-    # Allow necessary punctuation and symbols
-    sanitized = re.sub(r'[^\w\s,.\-:|°%/()"]', '', sanitized)
+
+    # Allow necessary punctuation, symbols, and preserved IRC formatting codes.
+    sanitized = re.sub(r'[^\w\s,.\-:|°%/()"\x02\x03\x0F\x16\x1D\x1F]', '', sanitized)
     return sanitized
 
 class ReconnectNeeded(Exception):
     """Custom exception to signal that a reconnection is needed."""
     pass
 
-class WarezResponder:
-    """Responds with random messages from a predefined list when triggered."""
+class ResponseFile:
+    """Reload responses when the backing file changes."""
 
-    def __init__(self, file_path):
-        try:
-            with open(file_path, 'r') as file:
-                self.responses = [line.strip() for line in file if line.strip()]
-        except FileNotFoundError:
-            logger.error(f"Warez file {file_path} not found.")
-            self.responses = ["No warez responses available."]
-        except Exception as e:
-            logger.error(f"Error loading warez responses: {e}")
-            self.responses = ["No warez responses available."]
-
-    def get_random_response(self):
-        """Get a random response from the list."""
-        return random.choice(self.responses) if self.responses else "No warez responses available."
-
-class StabResponder:
-    """Responds with random messages from a predefined list when triggered,
-    ensuring all lines are used before repeating. Dynamically reloads the file when it changes."""
-
-    def __init__(self, file_path):
+    def __init__(self, file_path, no_repeat=False, label="responses"):
         self.file_path = file_path
+        self.no_repeat = no_repeat
+        self.label = label
         self.last_modified_time = None
         self.responses = []
         self.available_responses = []
         self.load_responses()
 
     def load_responses(self):
-        """Load responses from the file and update the last modified time."""
         try:
-            current_modified_time = os.path.getmtime(self.file_path)
-            if self.last_modified_time != current_modified_time:
-                with open(self.file_path, 'r') as file:
-                    self.responses = [line.strip() for line in file if line.strip()]
-                self.last_modified_time = current_modified_time
-                logger.info(f"Reloaded responses from {self.file_path}.")
-                # Reset available_responses to start a new cycle with updated responses
-                self.available_responses = []
+            modified = os.path.getmtime(self.file_path)
+            if modified == self.last_modified_time:
+                return
+
+            with open(self.file_path, 'r') as file:
+                self.responses = [line.strip() for line in file if line.strip()]
+
+            self.last_modified_time = modified
+            self.available_responses.clear()
+            logger.info(f"Reloaded {self.label} from {self.file_path}.")
         except FileNotFoundError:
-            logger.error(f"Stab file {self.file_path} not found.")
-            self.responses = ["No stab responses available."]
-            self.available_responses = []
+            logger.error(f"Response file {self.file_path} not found.")
+            self.responses = [f"No {self.label} available."]
+            self.available_responses.clear()
         except Exception as e:
-            logger.error(f"Error loading stab responses: {e}")
-            self.responses = ["No stab responses available."]
-            self.available_responses = []
+            logger.error(f"Error loading {self.label}: {e}")
+            self.responses = [f"No {self.label} available."]
+            self.available_responses.clear()
 
     def get_random_response(self):
-        """Get a random response from the list without repeating until all have been used."""
-        # Check if the file has been modified and reload if necessary
         self.load_responses()
-
         if not self.responses:
-            return "No stab responses available."
+            return f"No {self.label} available."
+
+        if not self.no_repeat:
+            return random.choice(self.responses)
 
         if not self.available_responses:
             self.available_responses = self.responses.copy()
             random.shuffle(self.available_responses)
-            logger.debug("Shuffled stab responses for a new cycle.")
+            logger.debug(f"Shuffled {self.label} for a new cycle.")
 
-        response = self.available_responses.pop()
-        return response
+        return self.available_responses.pop()
+
 
 class IrcBot:
     """An IRC bot that provides weather information and responds to specific triggers."""
@@ -161,110 +151,166 @@ class IrcBot:
     def __init__(self):
         self.last_requests = defaultdict(lambda: deque(maxlen=RATE_LIMIT))
         self.global_request_times = deque(maxlen=GLOBAL_RATE_LIMIT)
-        self.warez_responder = WarezResponder(WAREZ_FILE)
-        self.stab_responder = StabResponder(STAB_FILE)
+        self.warez_responder = ResponseFile(WAREZ_FILE, label="warez responses")
+        self.stab_responder = ResponseFile(STAB_FILE, no_repeat=True, label="stab responses")
         self.last_pong_time = time.time()
         self.reader = None
         self.writer = None
         self.lock = asyncio.Lock()
-        self.reader_lock = asyncio.Lock()
         self.writer_lock = asyncio.Lock()
-        self.tasks = []
         self.weather_cache = TTLCache(maxsize=100, ttl=300)
         self.running = True
         self.message_semaphore = asyncio.Semaphore(1)
         self.current_nick = USER
-        self.pending_channels = set()
         self.reconnect_lock = asyncio.Lock()
-        self.connection_established = asyncio.Event()
-        self.authenticated = asyncio.Event()
+        # Store channel users in lowercase to enable case-insensitive checks
+        self.channel_users = defaultdict(set)
+        self.http_session = None
 
     async def connect(self):
-        """Establish a connection to the IRC server and register the bot."""
+        """Establish a TLS connection to the IRC server and authenticate with SASL."""
         try:
+            ssl_context = ssl.create_default_context()
             self.reader, self.writer = await asyncio.wait_for(
-                asyncio.open_connection(HOST, PORT), timeout=30)
+                asyncio.open_connection(
+                    HOST,
+                    PORT,
+                    ssl=ssl_context,
+                    server_hostname=HOST
+                ),
+                timeout=30
+            )
             await self.register()
             logger.info(f"Connected to IRC server as {self.current_nick}.")
-            await self.wait_for_registration()
-            # Authenticate after MOTD is fully received
-            await self.authenticate()
-            auth_success = await self.wait_for_nickserv_response("You are now identified for")
-            if not auth_success:
-                logger.error("Authentication failed. Exiting.")
-                await self.cleanup()
-                sys.exit(1)
-            logger.info("Authenticated with NickServ successfully.")
+            await self.authenticate_sasl()
+
+            if not await self.wait_for_registration():
+                await self.reclaim_nickname()
+
+            logger.info("Authenticated with SASL successfully.")
             await self.join_channels()
-            self.connection_established.set()
         except Exception as e:
             logger.error(f"Failed to connect to IRC: {e}")
             raise
 
+    async def send_raw(self, line):
+        """Send one raw IRC protocol line."""
+        if self.writer is None:
+            raise ConnectionError("No active IRC connection.")
+
+        async with self.writer_lock:
+            self.writer.write(f"{line}\r\n".encode('utf-8'))
+            await self.writer.drain()
+
     async def register(self):
-        """Register the bot with the IRC server."""
+        """Begin IRC registration and request SASL capability."""
         if self.writer is None:
             logger.error("Cannot register, no active connection.")
             return
 
-        async with self.writer_lock:
-            self.current_nick = USER
-            self.writer.write(f"NICK {self.current_nick}\r\n".encode('utf-8'))
-            self.writer.write(f"USER {USERNAME} 0 * :{USERNAME}\r\n".encode('utf-8'))
-            await self.writer.drain()
-        logger.info("Sent NICK and USER commands.")
+        self.current_nick = USER
+        await self.send_raw("CAP LS 302")
+        await self.send_raw(f"NICK {self.current_nick}")
+        await self.send_raw(f"USER {USERNAME} 0 * :{USERNAME}")
+        logger.info("Sent CAP LS, NICK, and USER commands.")
+
+    async def authenticate_sasl(self):
+        """Authenticate using IRCv3 SASL PLAIN over the existing TLS connection."""
+        if self.writer is None:
+            raise ReconnectNeeded("Cannot authenticate with SASL without an active connection.")
+
+        sasl_requested = False
+        sasl_started = False
+
+        while True:
+            line = await self.read_line_with_timeout(timeout=30)
+            if line is None:
+                raise ReconnectNeeded("Connection lost during SASL authentication.")
+
+            logger.debug(f"Received line during SASL negotiation: {line}")
+            prefix, command, params = self.parse_irc_message(line)
+
+            if command == 'PING':
+                await self.handle_ping(params)
+                continue
+
+            if command == 'CAP' and len(params) >= 2:
+                subcommand = params[1].upper()
+
+                if subcommand == 'LS':
+                    capabilities = params[-1].lower().split()
+                    if not any(cap == 'sasl' or cap.startswith('sasl=') for cap in capabilities):
+                        raise RuntimeError("IRC server does not advertise SASL capability.")
+
+                    await self.send_raw("CAP REQ :sasl")
+                    sasl_requested = True
+                    logger.info("Requested SASL capability.")
+                    continue
+
+                if subcommand == 'ACK' and sasl_requested:
+                    await self.send_raw("AUTHENTICATE PLAIN")
+                    sasl_started = True
+                    logger.info("SASL capability acknowledged; starting PLAIN authentication.")
+                    continue
+
+                if subcommand == 'NAK':
+                    raise RuntimeError("IRC server rejected SASL capability request.")
+
+            if command == 'AUTHENTICATE' and sasl_started and params and params[0] == '+':
+                auth_bytes = f"{USERNAME}\0{USERNAME}\0{PASSWORD}".encode('utf-8')
+                payload = base64.b64encode(auth_bytes).decode('ascii')
+
+                # IRC SASL AUTHENTICATE payloads are sent in chunks of at most
+                # 400 bytes. If the encoded payload is an exact multiple of 400,
+                # terminate it with an additional AUTHENTICATE +.
+                chunks = [payload[i:i + 400] for i in range(0, len(payload), 400)]
+
+                for chunk in chunks:
+                    await self.send_raw(f"AUTHENTICATE {chunk}")
+                if payload and len(payload) % 400 == 0:
+                    await self.send_raw("AUTHENTICATE +")
+
+                logger.info("Sent SASL PLAIN credentials.")
+                continue
+
+            if command == '903':
+                await self.send_raw("CAP END")
+
+                logger.info("SASL authentication successful.")
+                return
+
+            if command in {'904', '905', '906', '907'}:
+                raise RuntimeError(f"SASL authentication failed with numeric {command}.")
 
     async def read_line_with_timeout(self, timeout=300):
-        """Read a line from the server with a timeout and reader lock."""
-        try:
-            async with self.reader_lock:
-                line = await asyncio.wait_for(self.reader.readline(), timeout=timeout)
-            if not line:
-                return None
-            return line.decode('utf-8', errors='replace').strip()
-        except asyncio.TimeoutError:
-            logger.error("Timed out reading from server.")
-            raise
-        except Exception as e:
-            logger.error(f"Error reading from server: {e}")
-            raise
+        """Read one IRC line with a timeout."""
+        line = await asyncio.wait_for(self.reader.readline(), timeout=timeout)
+        if not line:
+            return None
+        return line.decode('utf-8', errors='replace').strip()
 
     async def wait_for_registration(self):
-        """Wait for the server's response to nickname registration."""
+        """Wait for registration to finish; return False if the nick is in use."""
         while True:
-            try:
-                line = await self.read_line_with_timeout()
-                if line is None:
-                    logger.error("Connection lost during registration.")
-                    raise ReconnectNeeded()
-                logger.debug(f"Received line during registration: {line}")
-                prefix, command, params = self.parse_irc_message(line)
-                if command == '001':
-                    logger.info(f"Received welcome message from server.")
-                    # Continue waiting for end of MOTD
-                elif command == '376' or command == '422':
-                    logger.info("End of MOTD received.")
-                    break  # Now we can proceed
-                elif command == '433':
-                    logger.warning(f"Nickname {self.current_nick} is already in use.")
-                    await self.handle_nickname_in_use()
-                    break
-                elif command == '451':
-                    logger.error("Received ERR_NOTREGISTERED: You have not registered.")
-                    await self.register()
-                elif command == 'PING':
-                    await self.handle_ping(params)
-                else:
-                    logger.debug(f"Ignoring message during registration: {line}")
-            except ConnectionError as e:
-                logger.error(f"Connection error during registration: {e}")
-                raise ReconnectNeeded()
-            except asyncio.TimeoutError:
-                logger.error("Timed out waiting for registration response.")
-                raise ReconnectNeeded()
-            except Exception as e:
-                logger.error(f"Error during registration: {e}")
-                raise ReconnectNeeded()
+            line = await self.read_line_with_timeout()
+            if line is None:
+                raise ReconnectNeeded("Connection lost during registration.")
+
+            logger.debug(f"Received line during registration: {line}")
+            _, command, params = self.parse_irc_message(line)
+
+            if command == '001':
+                logger.info("Received welcome message from server.")
+            elif command in {'376', '422'}:
+                logger.info("End of MOTD received.")
+                return True
+            elif command == '433':
+                logger.warning(f"Nickname {self.current_nick} is already in use.")
+                return False
+            elif command == 'PING':
+                await self.handle_ping(params)
+            else:
+                logger.debug(f"Ignoring message during registration: {line}")
 
     def parse_irc_message(self, message):
         """Parse an IRC message into its prefix, command, and parameters."""
@@ -292,44 +338,40 @@ class IrcBot:
         if self.writer is None:
             logger.error("Cannot respond to PING, no active connection.")
             return
-        async with self.writer_lock:
-            self.writer.write(f"PONG :{params[0]}\r\n".encode('utf-8'))
-            await self.writer.drain()
+        await self.send_raw(f"PONG :{params[0]}")
         self.last_pong_time = time.time()
         logger.debug("Responded to PING with PONG.")
 
     async def reconnect(self):
-        """Attempt to reconnect to the IRC server with retries and exponential backoff."""
+        """Reconnect with exponential backoff."""
         async with self.reconnect_lock:
-            retry_delay = 10
-            retries = 0
-            MAX_BACKOFF = 300
-            logger.info("Attempting to reconnect to IRC server...")
             await self.close_connection()
-            while self.running:
+            delay = 30
+
+            for attempt in range(1, 11):
+                if not self.running:
+                    return
+
+                logger.info(f"Retrying connection in {delay} seconds...")
+                await asyncio.sleep(delay)
+
                 try:
-                    logger.info(f"Reconnecting as {self.current_nick} (Attempt {retries + 1})...")
+                    logger.info(f"Reconnect attempt {attempt}...")
                     await self.connect()
-                    break
-                except Exception as e:
-                    logger.exception(f"Reconnection attempt failed: {e}")
-                    retries += 1
-                    if retries >= 10:
-                        logger.error("Exceeded maximum reconnection attempts. Exiting.")
-                        await self.cleanup()
-                        sys.exit(1)
-                    logger.info(f"Retrying in {retry_delay} seconds (Attempt {retries})...")
-                    await asyncio.sleep(retry_delay)
-                    retry_delay = min(retry_delay * 2, MAX_BACKOFF)
+                    return
+                except Exception:
+                    logger.exception(f"Reconnect attempt {attempt} failed.")
+                    delay = min(delay * 2, 300)
+
+            logger.error("Exceeded maximum reconnect attempts. Exiting.")
+            await self.cleanup()
+            sys.exit(1)
 
     async def close_connection(self):
         """Close the existing IRC connection."""
-        self.connection_established.clear()
         if self.writer:
             try:
-                async with self.writer_lock:
-                    self.writer.write("QUIT :Reconnecting...\r\n".encode('utf-8'))
-                    await self.writer.drain()
+                await self.send_raw("QUIT :Reconnecting...")
             except Exception as e:
                 logger.error(f"Error sending QUIT command: {e}")
             try:
@@ -346,13 +388,9 @@ class IrcBot:
             logger.error("Cannot join channels, no active connection.")
             return
 
-        self.pending_channels = set(CHANNELS)
-
         for channel in CHANNELS:
             logger.info(f"Joining channel {channel}")
-            async with self.writer_lock:
-                self.writer.write(f"JOIN {channel}\r\n".encode('utf-8'))
-                await self.writer.drain()
+            await self.send_raw(f"JOIN {channel}")
             await asyncio.sleep(1)
 
     async def handle_privmsg(self, prefix, params):
@@ -410,13 +448,20 @@ class IrcBot:
         if self.writer is None:
             logger.error("Cannot send NOTICE, no active connection.")
             return
-        async with self.writer_lock:
-            self.writer.write(f"NOTICE {target} :{message}\r\n".encode('utf-8'))
-            await self.writer.drain()
+        await self.send_raw(f"NOTICE {target} :{message}")
         logger.debug(f"Sent NOTICE to {target}: {message}")
 
     async def handle_stab_command(self, channel, target_user):
-        """Respond to the stab trigger with the specified target user."""
+        """Respond to the stab trigger with the specified target user, case-insensitive."""
+        # Convert target_user to lowercase for comparison
+        target_user_lower = target_user.lower()
+        # Check if the target_user is in the channel before responding
+        if target_user_lower not in self.channel_users[channel]:
+            message = f"{target_user} is not currently in {channel}."
+            await self.send_message(channel, message)
+            logger.info(f"User {target_user} not found in {channel}, no stab response sent.")
+            return
+
         response_line = self.stab_responder.get_random_response()
         message = f"hftb stabs {target_user} {response_line}"
         await self.send_message(channel, message)
@@ -465,26 +510,28 @@ class IrcBot:
             else:
                 days = 2 if forecast else 1
                 url = f"https://api.weatherapi.com/v1/forecast.json?key={API_KEY}&q={quote(location)}&days={days}&aqi=no&alerts=no"
-                timeout = aiohttp.ClientTimeout(total=10)
-                async with aiohttp.ClientSession(timeout=timeout) as session:
-                    async with session.get(url) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                        elif resp.status == 401:
-                            logger.error("Unauthorized access. Check your API key.")
-                            error_msg = "Unauthorized access to weather API. Please check the API key."
-                            await self.send_message(channel, error_msg)
-                            return
-                        elif resp.status == 404:
-                            logger.error(f"Location '{location}' not found.")
-                            error_msg = f"Location '{location}' not found."
-                            await self.send_message(channel, error_msg)
-                            return
-                        else:
-                            logger.error(f"HTTP error {resp.status} when fetching weather data for {location}.")
-                            error_msg = f"Error fetching weather information for {location}."
-                            await self.send_message(channel, error_msg)
-                            return
+                if self.http_session is None or self.http_session.closed:
+                    timeout = aiohttp.ClientTimeout(total=10)
+                    self.http_session = aiohttp.ClientSession(timeout=timeout)
+
+                async with self.http_session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                    elif resp.status == 401:
+                        logger.error("Unauthorized access. Check your API key.")
+                        error_msg = "Unauthorized access to weather API. Please check the API key."
+                        await self.send_message(channel, error_msg)
+                        return
+                    elif resp.status == 404:
+                        logger.error(f"Location '{location}' not found.")
+                        error_msg = f"Location '{location}' not found."
+                        await self.send_message(channel, error_msg)
+                        return
+                    else:
+                        logger.error(f"HTTP error {resp.status} when fetching weather data for {location}.")
+                        error_msg = f"Error fetching weather information for {location}."
+                        await self.send_message(channel, error_msg)
+                        return
                 self.weather_cache[cache_key] = data
 
             # Extract and format the weather data
@@ -646,95 +693,51 @@ class IrcBot:
         if self.writer is None:
             logger.error("Cannot send message, no active connection.")
             return
-        async with self.writer_lock:
-            self.writer.write(f"PRIVMSG {target} :{message}\r\n".encode('utf-8'))
-            await self.writer.drain()
+        await self.send_raw(f"PRIVMSG {target} :{message}")
 
     async def run(self):
-        """Run the bot."""
+        """Run the bot, reconnecting when the connection fails."""
         while self.running:
             try:
                 logger.info("Starting connection to IRC server...")
                 await self.connect()
+                self.last_pong_time = time.time()
                 logger.info("Starting to handle messages...")
-                await self.start_background_tasks()
                 await self.handle_messages()
+            except asyncio.CancelledError:
+                raise
             except ReconnectNeeded:
                 logger.info("Reconnect needed, reconnecting...")
-                await self.cleanup_tasks()
                 await self.reconnect()
             except Exception as e:
                 logger.exception(f"Unhandled exception in run: {e}")
-                await self.cleanup_tasks()
                 await self.reconnect()
-
-    async def start_background_tasks(self):
-        """Start background tasks for connection monitoring."""
-        self.tasks.append(asyncio.create_task(self.monitor_connection()))
-
-    async def monitor_connection(self):
-        """Monitor the connection and send PING messages as needed."""
-        try:
-            while self.running:
-                await asyncio.sleep(PING_INTERVAL)
-                if not self.running:
-                    break
-                current_time = time.time()
-                if current_time - self.last_pong_time > PING_TIMEOUT:
-                    logger.warning("No PONG received within timeout. Reconnecting...")
-                    raise ReconnectNeeded()
-                else:
-                    await self.send_ping()
-        except asyncio.CancelledError:
-            logger.info("monitor_connection task cancelled.")
-        except ReconnectNeeded:
-            raise
-        except Exception as e:
-            logger.exception(f"Exception in monitor_connection: {e}")
-            raise ReconnectNeeded()
 
     async def send_ping(self):
         """Send a PING message to the server."""
         if self.writer is None:
             logger.error("Cannot send PING, no active connection.")
             return
-        async with self.writer_lock:
-            self.writer.write(f"PING :{self.current_nick}\r\n".encode('utf-8'))
-            await self.writer.drain()
+        await self.send_raw(f"PING :{self.current_nick}")
         logger.debug("Sent PING to server.")
 
-    async def cleanup_tasks(self):
-        """Cancel all running tasks."""
-        for task in self.tasks:
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
-        self.tasks.clear()
-
     async def handle_messages(self):
-        """Handle incoming messages from the IRC server."""
-        try:
-            while self.running:
-                try:
-                    line = await self.read_line_with_timeout()
-                    if line is None:
-                        raise ConnectionError("Connection lost: received empty response.")
-                    logger.debug(f"Received line: {line}")
-                    await self.process_line(line)
-                except asyncio.CancelledError:
-                    logger.info("handle_messages task cancelled.")
-                    raise
-                except ConnectionError as e:
-                    logger.error(f"Connection error in message handling: {e}")
+        """Handle IRC traffic and connection liveness."""
+        while self.running:
+            try:
+                line = await self.read_line_with_timeout(timeout=PING_INTERVAL)
+            except asyncio.TimeoutError:
+                if time.time() - self.last_pong_time > PING_TIMEOUT:
+                    logger.warning("IRC connection timed out. Reconnecting...")
                     raise ReconnectNeeded()
-                except asyncio.TimeoutError:
-                    logger.error("Timed out while waiting for messages.")
-                    raise ReconnectNeeded()
-                except Exception as e:
-                    logger.exception(f"Unhandled exception in handle_messages: {e}")
-                    raise ReconnectNeeded()
-        except ReconnectNeeded:
-            raise
+                await self.send_ping()
+                continue
+
+            if line is None:
+                raise ReconnectNeeded("IRC connection closed.")
+
+            logger.debug(f"Received line: {line}")
+            await self.process_line(line)
 
     async def process_line(self, line):
         """Process a single line from the IRC server."""
@@ -750,6 +753,19 @@ class IrcBot:
                 await self.handle_notice(prefix, params)
             elif command == 'PRIVMSG':
                 await self.handle_privmsg(prefix, params)
+            elif command == 'JOIN':
+                await self.handle_join(prefix, params)
+            elif command == 'PART':
+                await self.handle_part(prefix, params)
+            elif command == 'QUIT':
+                await self.handle_quit(prefix)
+            elif command == '353':
+                await self.handle_namereply(params)
+            elif command == '366':
+                # RPL_ENDOFNAMES, we can ignore or just log
+                logger.debug("End of NAMES list received.")
+            elif command == 'KICK':
+                await self.handle_kick(prefix, params)
             elif command == 'ERROR':
                 error_message = ' '.join(params)
                 logger.error(f"Server error: {error_message}")
@@ -758,13 +774,10 @@ class IrcBot:
                     raise ReconnectNeeded()
                 else:
                     raise ReconnectNeeded()
-            elif command == 'KICK':
-                await self.handle_kick(prefix, params)
-            elif command == '433':
-                logger.warning("Nickname is already in use.")
-                await self.handle_nickname_in_use()
             else:
                 logger.debug(f"Unhandled message: {line}")
+        except ReconnectNeeded:
+            raise
         except Exception as e:
             logger.exception(f"Unhandled exception in process_line: {e}")
 
@@ -788,159 +801,117 @@ class IrcBot:
         message = params[-1]
         logger.info(f"Received NOTICE from {sender_nick}: {message}")
 
-        if sender_nick.lower() == 'nickserv':
-            if 'identify' in message.lower() and 'registered' in message.lower():
-                logger.info("NickServ is requesting identification. Sending IDENTIFY command.")
-                await self.authenticate()
-            elif 'you are now identified for' in message.lower():
-                logger.info("Successfully identified with NickServ.")
-                self.authenticated.set()
-            elif 'invalid password' in message.lower():
-                logger.error("Invalid password provided to NickServ.")
-                await self.cleanup()
-                sys.exit(1)
 
-    async def handle_nickname_in_use(self):
-        """Handle situation when the nickname is already in use."""
-        if self.writer is None:
-            logger.warning("Cannot reclaim nickname, no active connection.")
-            return
+    async def wait_for_nick_result(self, nick):
+        """Wait for a NICK change to succeed or fail."""
+        while True:
+            line = await self.read_line_with_timeout(timeout=30)
+            if line is None:
+                raise ReconnectNeeded("Connection lost while changing nickname.")
 
-        max_attempts = 5
-        attempt = 0
-        base_nick = USER
+            logger.debug(f"Received line during nickname change: {line}")
+            _, command, params = self.parse_irc_message(line)
 
-        while attempt < max_attempts:
-            alternate_nick = f"{base_nick}_{attempt}"
-            logger.info(f"Nickname {self.current_nick} is in use. Trying alternate nickname {alternate_nick}")
-            async with self.writer_lock:
-                self.writer.write(f"NICK {alternate_nick}\r\n".encode('utf-8'))
-                await self.writer.drain()
-            self.current_nick = alternate_nick
-
-            # Wait for server acknowledgment
-            result = await self.wait_for_nickname_response()
-            if result == 'success':
-                logger.info(f"Nickname changed to {self.current_nick}")
-                break
-            elif result == 'in_use':
-                attempt += 1
-                continue
-            else:
-                logger.error("Unexpected response when trying to change nickname.")
-                attempt += 1
-
-        if attempt >= max_attempts:
-            logger.error("Failed to register after multiple attempts.")
-            await self.cleanup()
-            sys.exit(1)
-
-        # Wait for registration to complete
-        await self.wait_for_registration()
-
-        # Authenticate with NickServ
-        await self.authenticate()
-        auth_success = await self.wait_for_nickserv_response("You are now identified for")
-        if not auth_success:
-            logger.error("Authentication failed after nickname change. Exiting.")
-            await self.cleanup()
-            sys.exit(1)
-
-        # Attempt to GHOST the original nickname
-        logger.info(f"Attempting to reclaim nickname {USER} using NickServ GHOST command.")
-        await self.send_privmsg("NickServ", f"GHOST {USER} {PASSWORD}")
-
-        # Wait for NickServ confirmation
-        success = await self.wait_for_nickserv_response("has been ghosted")
-        if success:
-            logger.info(f"Successfully ghosted {USER}. Changing nickname back.")
-            # Change back to the original nickname
-            async with self.writer_lock:
-                self.writer.write(f"NICK {USER}\r\n".encode('utf-8'))
-                await self.writer.drain()
-            self.current_nick = USER
-
-            # Wait for the server to acknowledge the nickname change
-            result = await self.wait_for_nickname_response()
-            if result != 'success':
-                logger.error(f"Failed to change back to original nickname {USER}. Continuing with {self.current_nick}")
-            else:
-                await self.wait_for_registration()
-        else:
-            logger.error("Failed to ghost the original nickname. Continuing with alternate nickname.")
-
-    async def wait_for_nickname_response(self):
-        """Wait for the server's response to the NICK command."""
-        attempts = 0
-        max_attempts = 10
-        while attempts < max_attempts:
-            attempts += 1
-            try:
-                line = await self.read_line_with_timeout(timeout=30)
-                if line is None:
-                    raise ConnectionError("Connection lost.")
-                logger.debug(f"Received line during nickname change: {line}")
-                prefix, command, params = self.parse_irc_message(line)
-                if command == '001':
-                    logger.info(f"Nickname {self.current_nick} accepted by server.")
-                    return 'success'
-                elif command == '433':
-                    logger.warning(f"Nickname {self.current_nick} is already in use.")
-                    return 'in_use'
-                elif command == 'PING':
-                    await self.handle_ping(params)
-                else:
-                    logger.debug(f"Unhandled message during nickname change: {line}")
-            except Exception as e:
-                logger.error(f"Error while waiting for nickname response: {e}")
-                return 'error'
-        logger.error("Maximum attempts reached while waiting for nickname response.")
-        return 'error'
-
-    async def wait_for_nickserv_response(self, expected_message):
-        """Wait for a specific response from NickServ."""
-        attempts = 0
-        max_attempts = 20
-        while attempts < max_attempts:
-            attempts += 1
-            try:
-                line = await self.read_line_with_timeout(timeout=30)
-                if line is None:
-                    logger.error("Connection lost while waiting for NickServ response.")
-                    return False
-                logger.debug(f"Received line waiting for NickServ response: {line}")
-                prefix, command, params = self.parse_irc_message(line)
-                if command == 'NOTICE':
-                    sender_nick = prefix.split('!')[0]
-                    message = params[-1]
-                    if sender_nick.lower() == 'nickserv' and expected_message.lower() in message.lower():
-                        logger.info(f"Received expected NickServ message: {message}")
-                        return True
-                elif command == 'PING':
-                    await self.handle_ping(params)
-                else:
-                    logger.debug(f"Unhandled message while waiting for NickServ response: {line}")
-            except Exception as e:
-                logger.error(f"Error while waiting for NickServ response: {e}")
+            if command == 'NICK':
+                return True
+            if command == '433':
                 return False
-        logger.error("Maximum attempts reached while waiting for NickServ response.")
-        return False
+            if command == 'PING':
+                await self.handle_ping(params)
+                continue
+            if command == '001' and self.current_nick.lower() == nick.lower():
+                return True
 
-    async def authenticate(self):
-        """Authenticate the bot with NickServ."""
-        if self.writer is None:
-            logger.error("Cannot authenticate, no active connection.")
+    async def wait_for_nickserv(self, expected_message):
+        """Wait for a matching NickServ NOTICE."""
+        while True:
+            line = await self.read_line_with_timeout(timeout=30)
+            if line is None:
+                raise ReconnectNeeded("Connection lost while waiting for NickServ.")
+
+            logger.debug(f"Received line waiting for NickServ response: {line}")
+            prefix, command, params = self.parse_irc_message(line)
+
+            if command == 'PING':
+                await self.handle_ping(params)
+                continue
+
+            if command != 'NOTICE' or not prefix:
+                continue
+
+            sender = prefix.split('!')[0].lower()
+            message = params[-1] if params else ""
+            if sender == 'nickserv' and expected_message.lower() in message.lower():
+                logger.info(f"Received expected NickServ message: {message}")
+                return True
+
+    async def reclaim_nickname(self):
+        """Use an alternate nick, GHOST the preferred nick, then switch back."""
+        for suffix in range(5):
+            alternate = f"{USER}_{suffix}"
+            logger.info(f"Trying alternate nickname {alternate}.")
+            await self.send_raw(f"NICK {alternate}")
+            self.current_nick = alternate
+
+            if await self.wait_for_nick_result(alternate):
+                break
+        else:
+            raise ReconnectNeeded("Unable to obtain an alternate nickname.")
+
+        await self.send_privmsg("NickServ", f"GHOST {USER} {PASSWORD}")
+        await self.wait_for_nickserv("has been ghosted")
+
+        logger.info(f"Reclaiming nickname {USER}.")
+        await self.send_raw(f"NICK {USER}")
+        self.current_nick = USER
+
+        if not await self.wait_for_nick_result(USER):
+            raise ReconnectNeeded(f"Unable to reclaim nickname {USER}.")
+
+    async def handle_join(self, prefix, params):
+        """Handle JOIN events."""
+        user = prefix.split('!')[0].lower()
+        channel = params[0]
+        self.channel_users[channel].add(user)
+        logger.debug(f"{user} joined {channel}. Current users: {self.channel_users[channel]}")
+
+    async def handle_part(self, prefix, params):
+        """Handle PART events."""
+        user = prefix.split('!')[0].lower()
+        channel = params[0]
+        if user in self.channel_users[channel]:
+            self.channel_users[channel].remove(user)
+            logger.debug(f"{user} parted {channel}. Current users: {self.channel_users[channel]}")
+
+    async def handle_quit(self, prefix):
+        """Handle QUIT events."""
+        user = prefix.split('!')[0].lower()
+        for ch, users in self.channel_users.items():
+            if user in users:
+                users.remove(user)
+                logger.debug(f"{user} quit. Removed from {ch}. Current users in {ch}: {users}")
+
+    async def handle_namereply(self, params):
+        """Handle RPL_NAMREPLY (353) which contains a list of users in a channel."""
+        # Expected form: params = [<my_nick>, <symbol>, <channel>, "<names...>"]
+        if len(params) < 4:
             return
-
-        # Use the current nickname for identification
-        await self.send_privmsg("NickServ", f"IDENTIFY {USERNAME} {PASSWORD}")
-        logger.info(f"Sent NickServ IDENTIFY command for nick {self.current_nick}.")
+        channel = params[2]
+        names_list = params[3].strip()
+        if names_list.startswith(':'):
+            names_list = names_list[1:]
+        users = names_list.split()
+        # Strip status symbols (@, +, etc.) and convert to lowercase
+        sanitized_users = {u.lstrip('@+%&~').lower() for u in users}
+        self.channel_users[channel].update(sanitized_users)
+        logger.debug(f"Updated channel user list for {channel}: {self.channel_users[channel]}")
 
     async def cleanup(self):
         """Clean up resources on shutdown."""
         self.running = False
-        await self.cleanup_tasks()
         await self.close_connection()
+        if self.http_session and not self.http_session.closed:
+            await self.http_session.close()
         logger.info("Cleaned up resources.")
 
 if __name__ == "__main__":
@@ -949,6 +920,10 @@ if __name__ == "__main__":
     async def main():
         try:
             await bot.run()
+        except asyncio.CancelledError:
+            logger.info("Main task cancelled. Shutting down...")
+            if bot.running:
+                await bot.cleanup()
         except KeyboardInterrupt:
             logger.info("KeyboardInterrupt received. Shutting down...")
             if bot.running:
@@ -958,16 +933,21 @@ if __name__ == "__main__":
             if bot.running:
                 await bot.cleanup()
 
-    # Handle SIGTERM on Unix systems
-    if hasattr(signal, 'SIGTERM'):
-        def handle_sigterm(signum, frame):
-            logger.info("SIGTERM received. Shutting down...")
-            asyncio.create_task(bot.cleanup())
+    async def runner():
+        loop = asyncio.get_running_loop()
+        main_task = asyncio.create_task(main())
 
-        signal.signal(signal.SIGTERM, handle_sigterm)
+        if hasattr(signal, 'SIGTERM'):
+            def handle_sigterm():
+                logger.info("SIGTERM received. Shutting down...")
+                main_task.cancel()
+
+            loop.add_signal_handler(signal.SIGTERM, handle_sigterm)
+
+        await main_task
 
     try:
-        asyncio.run(main())
+        asyncio.run(runner())
     except KeyboardInterrupt:
         logger.info("Bot shut down gracefully.")
         sys.exit(0)
