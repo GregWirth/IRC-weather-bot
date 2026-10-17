@@ -132,6 +132,30 @@ The selected line is used once per cycle before being repeated. After every avai
 
 The response file is automatically reloaded when changed.
 
+## Channel Administration Commands (v1.02)
+
+Version 1.02 adds three administration commands. Enter them in an IRC channel; the bot replies in the same channel where the command was issued. They are not handled through private messages.
+
+| Command | Response |
+| --- | --- |
+| `##status` | IRC connection status, current bot nickname, number of configured channels, and uptime. |
+| `##uptime` | Elapsed time since the bot process started (days, hours, minutes, seconds). |
+| `##stats` | Weather requests, WeatherAPI requests, cache hits, weather errors, and current weather-cache entries. |
+
+Configure the administrator account(s) in `config.json` by adding an `ADMIN_ACCOUNTS` setting alongside the existing settings:
+
+```json
+"ADMIN_ACCOUNTS": ["YOUR_REGISTERED_IRC_ACCOUNT"]
+```
+
+For multiple administrators, use `"ADMIN_ACCOUNTS": ["account1", "account2"]`. Enter **registered IRC account names**, not visible nicknames or WHOIS hostmasks. The bot checks the server-provided IRCv3 `account-tag` identity. Unauthorized commands are ignored and logged.
+
+If `ADMIN_ACCOUNTS` is missing or set to an empty list (`[]`), **all administrative commands are disabled**. Restart the bot after changing `config.json`; administrative account changes are not hot-reloaded. When adding the entry to an existing JSON object, remember to separate entries with commas. The GitHub example configuration should contain only a placeholder account, never your own identity or real passwords.
+
+The IRC server must support both `sasl` and `account-tag` capabilities. The bot requests both during connection setup; this version will refuse to connect if `account-tag` is unavailable.
+
+Statistics are kept in memory and reset when the bot process restarts. They do not persist between restarts.
+
 ## IRC Connection Features
 
 The bot:
@@ -139,6 +163,7 @@ The bot:
 * connects using TLS
 * uses IRC port 6697 by default
 * authenticates using SASL PLAIN
+* requests IRCv3 `account-tag` to authenticate channel administration commands
 * responds to IRC server PING requests
 * monitors connection liveness
 * detects connection loss and timeouts
