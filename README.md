@@ -194,3 +194,58 @@ Consequently, while the codebase has been engineered with rigorous adherence to 
 practices in software development and systems engineering, it is imperative to
 acknowledge that the multifaceted dynamics of real-world application could precipitate
 idiosyncratic issues not previously elucidated during the testing phases.
+
+## v1.03 security and stability updates
+
+The bot retains the same user-facing weather, `!warez`, `#stab`, and authenticated channel administration commands (`##status`, `##uptime`, `##stats`). Weather output remains **one IRC message maximum**, capped at **400 characters** (and also respects IRC's 512-byte wire limit). Responses longer than this are truncated, not split.
+
+Changes include:
+
+- One connection lifecycle manager with retry backoff and cleanup to avoid duplicate connections.
+- Concurrent, bounded weather processing so slow HTTP requests do not block server PING traffic.
+- IRC PING/PONG matching with monotonic timers.
+- Per-user/per-channel cooldowns for entertainment triggers; rejected weather requests no longer consume global quota.
+- Channel membership updated on nickname changes, cleared after reconnect, and KICK rejoins only the affected channel.
+- Last known-good trigger responses retained after temporary file errors.
+- Validation of required config values, safer UTF-8 outgoing IRC message size handling, and additional runtime statistics.
+- Reduced raw IRC debug logging to avoid accidentally recording credentials and personal message content.
+
+Optional settings in `config.json` (within the top-level JSON object):
+
+```json
+"ENTERTAINMENT_COOLDOWN": 12,
+"WEATHER_CONCURRENCY": 3
+```
+
+`ENTERTAINMENT_COOLDOWN` is the minimum number of seconds between the same sender's uses of the same entertainment trigger in the same channel. `WEATHER_CONCURRENCY` limits simultaneous weather lookups. Both have the defaults shown; you can omit them.
+
+`ADMIN_ACCOUNTS` should list **registered, authenticated IRC account names**, not hostmasks or nicknames. For example, a published *sample* can use:
+
+```json
+"ADMIN_ACCOUNTS": ["YOUR_IRC_ACCOUNT"]
+```
+
+Put your real authenticated account name only in your private installation config. Empty or absent `ADMIN_ACCOUNTS` disables admin commands. The IRC server must provide `account-tag` for this implementation.
+
+### Validate and test before deploying
+
+From the directory containing the script and `config.json`:
+
+```sh
+python3 -m json.tool config.json >/dev/null
+python3 -m py_compile irc-weather-bot_v1.03.py
+```
+
+The companion `test_irc_weather_v103.py` uses an isolated, placeholder configuration and requires `aiohttp` and `cachetools` in your Python environment. Place it alongside the v1.03 Python file and run:
+
+```sh
+python3 -m unittest -v test_irc_weather_v103.py
+```
+
+### FreeBSD upgrade (existing rc.d installation)
+
+Your wrapper may still reference an older Python filename. Keep a backup, **leave your real config.json on the server**, then copy the new script to your installation directory. Update `/usr/local/sbin/irc_weather_run` to point at the new script name or replace the older filename after backing it up.
+
+Restart with `service irc_weather restart`, check `service irc_weather status`, and inspect `bot.log`. Test `##status`, `##uptime`, `##stats`, a normal weather lookup, and a response trigger. Roll back by restoring the previous Python file and restarting the service.
+
+**Limitations:** The included tests are offline. This release has not yet been exercised against a live IRC server or simulated netsplit. Legacy NickServ nickname recovery still uses a password-based GHOST request. Do not publish real `config.json` credentials or API keys; set `chmod 600 config.json` on the running installation.
